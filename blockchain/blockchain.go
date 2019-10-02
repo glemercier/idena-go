@@ -365,9 +365,12 @@ func (chain *Blockchain) applyBlockRewards(totalFee *big.Int, totalTips *big.Int
 	// update state
 	appState.State.AddBalance(block.Header.ProposedHeader.Coinbase, balanceAdd)
 	appState.State.AddStake(block.Header.ProposedHeader.Coinbase, stakeAdd)
+	chain.blockStatsCollector.AddMintedCoins(chain.config.Consensus.BlockReward)
+	chain.blockStatsCollector.AddBurntCoins(intBurn)
 	if penaltySub != nil {
 		appState.State.SubPenalty(block.Header.ProposedHeader.Coinbase, penaltySub)
 		chain.blockStatsCollector.AfterSubPenalty(block.Header.ProposedHeader.Coinbase, penaltySub, appState)
+		chain.blockStatsCollector.AddBurntCoins(penaltySub)
 	}
 	chain.blockStatsCollector.AddProposerReward(block.Header.ProposedHeader.Coinbase, reward, stake)
 
@@ -437,6 +440,9 @@ func setNewIdentitiesAttributes(appState *appstate.AppState, networkSize int, va
 				appState.State.SetInvites(addr, 0)
 				appState.IdentityState.Add(addr)
 			case state.Killed, state.Undefined:
+				// Stake of killed identity is burnt
+				collector.AddBurntCoins(appState.State.GetStakeBalance(addr))
+
 				removeLinksWithInviterAndInvitees(appState.State, addr)
 				appState.State.SetInvites(addr, 0)
 				appState.State.SetRequiredFlips(addr, 0)
@@ -545,9 +551,12 @@ func (chain *Blockchain) rewardFinalCommittee(appState *appstate.AppState, block
 		// update state
 		appState.State.AddBalance(addr, balanceAdd)
 		appState.State.AddStake(addr, stakeAdd)
+		chain.blockStatsCollector.AddMintedCoins(reward)
+		chain.blockStatsCollector.AddMintedCoins(stake)
 		if penaltySub != nil {
 			appState.State.SubPenalty(addr, penaltySub)
 			chain.blockStatsCollector.AfterSubPenalty(addr, penaltySub, appState)
+			chain.blockStatsCollector.AddBurntCoins(penaltySub)
 		}
 		chain.blockStatsCollector.AddFinalCommitteeReward(addr, reward, stake)
 	}
@@ -611,6 +620,7 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		// zero balance and kill temp identity
 		stateDB.SetBalance(sender, big.NewInt(0))
 		stateDB.SetState(sender, state.Killed)
+		chain.blockStatsCollector.AddBurntCoins(appState.State.GetStakeBalance(sender))
 
 		// verify identity and add transfer all available funds from temp account
 		recipient := *tx.To
