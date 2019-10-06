@@ -9,6 +9,7 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/pkg/errors"
 	"time"
 )
@@ -29,17 +30,22 @@ type fullSync struct {
 	appState             *appstate.AppState
 	potentialForkedPeers mapset.Set
 	deferredHeaders      []blockPeer
+	statsCollector       collector.StatsCollector
 }
 
 func (fs *fullSync) batchSize() uint64 {
 	return FullSyncBatchSize
 }
 
-func NewFullSync(pm *ProtocolManager, log log.Logger,
+func NewFullSync(
+	pm *ProtocolManager,
+	log log.Logger,
 	chain *blockchain.Blockchain,
 	ipfs ipfs.Proxy,
 	appState *appstate.AppState,
-	potentialForkedPeers mapset.Set) *fullSync {
+	potentialForkedPeers mapset.Set,
+	statsCollector collector.StatsCollector,
+) *fullSync {
 
 	return &fullSync{
 		appState:             appState,
@@ -50,6 +56,7 @@ func NewFullSync(pm *ProtocolManager, log log.Logger,
 		pm:                   pm,
 		isSyncing:            true,
 		ipfs:                 ipfs,
+		statsCollector:       statsCollector,
 	}
 }
 
@@ -80,7 +87,7 @@ func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, 
 			fs.log.Error("fail to retrieve block", "err", err)
 			return b.Header.Height(), err
 		} else {
-			if err := fs.chain.AddBlock(block, checkState); err != nil {
+			if err := fs.chain.AddBlock(block, checkState, fs.statsCollector); err != nil {
 				if err := fs.appState.ResetTo(fs.chain.Head.Height()); err != nil {
 					return block.Height(), err
 				}

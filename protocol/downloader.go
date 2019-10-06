@@ -16,6 +16,7 @@ import (
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/secstore"
+	"github.com/idena-network/idena-go/stats/collector"
 	"time"
 )
 
@@ -60,6 +61,7 @@ type Downloader struct {
 	sm                   *state.SnapshotManager
 	bus                  eventbus.Bus
 	secStore             *secstore.SecStore
+	statsCollector       collector.StatsCollector
 }
 
 func (d *Downloader) IsSyncing() bool {
@@ -74,7 +76,17 @@ func (d *Downloader) SyncProgress() (head uint64, top uint64) {
 	return height, d.top
 }
 
-func NewDownloader(pm *ProtocolManager, cfg *config.Config, chain *blockchain.Blockchain, ipfs ipfs.Proxy, appState *appstate.AppState, sm *state.SnapshotManager, bus eventbus.Bus, secStore *secstore.SecStore) *Downloader {
+func NewDownloader(
+	pm *ProtocolManager,
+	cfg *config.Config,
+	chain *blockchain.Blockchain,
+	ipfs ipfs.Proxy,
+	appState *appstate.AppState,
+	sm *state.SnapshotManager,
+	bus eventbus.Bus,
+	secStore *secstore.SecStore,
+	statsCollector collector.StatsCollector,
+) *Downloader {
 	return &Downloader{
 		pm:                   pm,
 		cfg:                  cfg,
@@ -87,6 +99,7 @@ func NewDownloader(pm *ProtocolManager, cfg *config.Config, chain *blockchain.Bl
 		sm:                   sm,
 		bus:                  bus,
 		secStore:             secStore,
+		statsCollector:       statsCollector,
 	}
 }
 
@@ -231,11 +244,11 @@ func (d *Downloader) GetBlock(header *types.Header) (*types.Block, error) {
 }
 
 func (d *Downloader) SeekBlocks(fromBlock, toBlock uint64, peers []string) chan *types.BlockBundle {
-	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers).SeekBlocks(fromBlock, toBlock, peers)
+	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, d.statsCollector).SeekBlocks(fromBlock, toBlock, peers)
 }
 
 func (d *Downloader) SeekForkedBlocks(ownBlocks []common.Hash, peerId string) chan types.BlockBundle {
-	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers).SeekForkedBlocks(ownBlocks, peerId)
+	return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, d.statsCollector).SeekForkedBlocks(ownBlocks, peerId)
 }
 
 func (d *Downloader) HasPotentialFork() bool {
@@ -270,7 +283,7 @@ func (d *Downloader) createBlockApplier() (loader blockApplier, toHeight uint64)
 		return NewFastSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, manifest, d.sm, d.bus, d.secStore.GetAddress()), manifest.Height
 	} else {
 		d.log.Info("Full sync will be used")
-		return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers), d.top
+		return NewFullSync(d.pm, d.log, d.chain, d.ipfs, d.appState, d.potentialForkedPeers, d.statsCollector), d.top
 	}
 }
 

@@ -55,25 +55,24 @@ var (
 )
 
 type Blockchain struct {
-	repo                *database.Repo
-	secStore            *secstore.SecStore
-	Head                *types.Header
-	PreliminaryHead     *types.Header
-	genesis             *types.Header
-	config              *config.Config
-	pubKey              []byte
-	coinBaseAddress     common.Address
-	log                 log.Logger
-	txpool              *mempool.TxPool
-	appState            *appstate.AppState
-	offlineDetector     *OfflineDetector
-	secretKey           *ecdsa.PrivateKey
-	ipfs                ipfs.Proxy
-	timing              *timing
-	bus                 eventbus.Bus
-	applyNewEpochFn     func(height uint64, appState *appstate.AppState, collector collector.BlockStatsCollector) (int, *types.ValidationAuthors, bool)
-	blockStatsCollector collector.BlockStatsCollector
-	isSyncing           bool
+	repo            *database.Repo
+	secStore        *secstore.SecStore
+	Head            *types.Header
+	PreliminaryHead *types.Header
+	genesis         *types.Header
+	config          *config.Config
+	pubKey          []byte
+	coinBaseAddress common.Address
+	log             log.Logger
+	txpool          *mempool.TxPool
+	appState        *appstate.AppState
+	offlineDetector *OfflineDetector
+	secretKey       *ecdsa.PrivateKey
+	ipfs            ipfs.Proxy
+	timing          *timing
+	bus             eventbus.Bus
+	applyNewEpochFn func(height uint64, appState *appstate.AppState, collector collector.StatsCollector) (int, *types.ValidationAuthors, bool)
+	isSyncing       bool
 }
 
 func init() {
@@ -86,24 +85,23 @@ func init() {
 	MaxHash = new(big.Float).SetInt(i)
 }
 
-func NewBlockchain(config *config.Config, db dbm.DB, txpool *mempool.TxPool, appState *appstate.AppState, ipfs ipfs.Proxy, secStore *secstore.SecStore,
-	bus eventbus.Bus, offlineDetector *OfflineDetector, blockStatsCollector collector.BlockStatsCollector) *Blockchain {
+func NewBlockchain(config *config.Config, db dbm.DB, txpool *mempool.TxPool, appState *appstate.AppState,
+	ipfs ipfs.Proxy, secStore *secstore.SecStore, bus eventbus.Bus, offlineDetector *OfflineDetector) *Blockchain {
 	return &Blockchain{
-		repo:                database.NewRepo(db),
-		config:              config,
-		log:                 log.New(),
-		txpool:              txpool,
-		appState:            appState,
-		ipfs:                ipfs,
-		timing:              NewTiming(config.Validation),
-		bus:                 bus,
-		secStore:            secStore,
-		offlineDetector:     offlineDetector,
-		blockStatsCollector: blockStatsCollector,
+		repo:            database.NewRepo(db),
+		config:          config,
+		log:             log.New(),
+		txpool:          txpool,
+		appState:        appState,
+		ipfs:            ipfs,
+		timing:          NewTiming(config.Validation),
+		bus:             bus,
+		secStore:        secStore,
+		offlineDetector: offlineDetector,
 	}
 }
 
-func (chain *Blockchain) ProvideApplyNewEpochFunc(fn func(height uint64, appState *appstate.AppState, collector collector.BlockStatsCollector) (int, *types.ValidationAuthors, bool)) {
+func (chain *Blockchain) ProvideApplyNewEpochFunc(fn func(height uint64, appState *appstate.AppState, collector collector.StatsCollector) (int, *types.ValidationAuthors, bool)) {
 	chain.applyNewEpochFn = fn
 }
 
@@ -252,7 +250,7 @@ func (chain *Blockchain) generateEmptyBlock(checkState *appstate.AppState, prevB
 	block.Header.EmptyBlockHeader.BlockSeed = types.Seed(crypto.Keccak256Hash(getSeedData(prevBlock)))
 	block.Header.EmptyBlockHeader.Flags = chain.calculateFlags(checkState, block)
 
-	chain.applyEmptyBlockOnState(checkState, block)
+	chain.applyEmptyBlockOnState(checkState, block, nil)
 
 	block.Header.EmptyBlockHeader.Root = checkState.State.Root()
 	block.Header.EmptyBlockHeader.IdentityRoot = checkState.IdentityState.Root()
@@ -263,7 +261,8 @@ func (chain *Blockchain) GenerateEmptyBlock() *types.Block {
 	return chain.generateEmptyBlock(chain.appState.Readonly(chain.Head.Height()), chain.Head)
 }
 
-func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppState) error {
+func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppState,
+	statsCollector collector.StatsCollector) error {
 
 	if err := validateBlockParentHash(block.Header, chain.Head); err != nil {
 		return err
@@ -271,9 +270,9 @@ func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppSt
 	if err := chain.ValidateBlock(block, checkState); err != nil {
 		return err
 	}
-	chain.blockStatsCollector.EnableCollecting()
-	defer chain.blockStatsCollector.CompleteCollecting()
-	diff, err := chain.processBlock(block)
+	statsCollector.EnableCollecting()
+	defer statsCollector.CompleteCollecting()
+	diff, err := chain.processBlock(block, statsCollector)
 	if err != nil {
 		return err
 	}
@@ -293,12 +292,14 @@ func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppSt
 	return nil
 }
 
-func (chain *Blockchain) processBlock(block *types.Block) (diff *state.IdentityStateDiff, err error) {
+func (chain *Blockchain) processBlock(block *types.Block,
+	statsCollector collector.StatsCollector) (diff *state.IdentityStateDiff, err error) {
+
 	var root, identityRoot common.Hash
 	if block.IsEmpty() {
-		root, identityRoot, diff = chain.applyEmptyBlockOnState(chain.appState, block)
+		root, identityRoot, diff = chain.applyEmptyBlockOnState(chain.appState, block, statsCollector)
 	} else {
-		if root, identityRoot, diff, err = chain.applyBlockOnState(chain.appState, block, chain.Head); err != nil {
+		if root, identityRoot, diff, err = chain.applyBlockOnState(chain.appState, block, chain.Head, statsCollector); err != nil {
 			chain.appState.Reset()
 			return nil, err
 		}
@@ -318,15 +319,20 @@ func (chain *Blockchain) processBlock(block *types.Block) (diff *state.IdentityS
 	return diff, nil
 }
 
-func (chain *Blockchain) applyBlockOnState(appState *appstate.AppState, block *types.Block, prevBlock *types.Header) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff, err error) {
+func (chain *Blockchain) applyBlockOnState(
+	appState *appstate.AppState,
+	block *types.Block,
+	prevBlock *types.Header,
+	statsCollector collector.StatsCollector,
+) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff, err error) {
 	var totalFee, totalTips *big.Int
-	if totalFee, totalTips, err = chain.processTxs(appState, block); err != nil {
+	if totalFee, totalTips, err = chain.processTxs(appState, block, statsCollector); err != nil {
 		return
 	}
 
-	chain.applyNewEpoch(appState, block)
-	chain.applyBlockRewards(totalFee, totalTips, appState, block, prevBlock)
-	chain.applyGlobalParams(appState, block)
+	chain.applyNewEpoch(appState, block, statsCollector)
+	chain.applyBlockRewards(totalFee, totalTips, appState, block, prevBlock, statsCollector)
+	chain.applyGlobalParams(appState, block, statsCollector)
 	chain.applyNextBlockFee(appState, block)
 	chain.applyVrfProposerThreshold(appState, block)
 
@@ -335,17 +341,22 @@ func (chain *Blockchain) applyBlockOnState(appState *appstate.AppState, block *t
 	return appState.State.Root(), appState.IdentityState.Root(), diff, nil
 }
 
-func (chain *Blockchain) applyEmptyBlockOnState(appState *appstate.AppState, block *types.Block) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff) {
+func (chain *Blockchain) applyEmptyBlockOnState(
+	appState *appstate.AppState,
+	block *types.Block,
+	statsCollector collector.StatsCollector,
+) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff) {
 
-	chain.applyNewEpoch(appState, block)
-	chain.applyGlobalParams(appState, block)
+	chain.applyNewEpoch(appState, block, statsCollector)
+	chain.applyGlobalParams(appState, block, statsCollector)
 	chain.applyVrfProposerThreshold(appState, block)
 	diff = appState.Precommit()
 
 	return appState.State.Root(), appState.IdentityState.Root(), diff
 }
 
-func (chain *Blockchain) applyBlockRewards(totalFee *big.Int, totalTips *big.Int, appState *appstate.AppState, block *types.Block, prevBlock *types.Header) {
+func (chain *Blockchain) applyBlockRewards(totalFee *big.Int, totalTips *big.Int, appState *appstate.AppState,
+	block *types.Block, prevBlock *types.Header, statsCollector collector.StatsCollector) {
 
 	// calculate fee reward
 	burnFee := decimal.NewFromBigInt(totalFee, 0)
@@ -365,16 +376,19 @@ func (chain *Blockchain) applyBlockRewards(totalFee *big.Int, totalTips *big.Int
 	// update state
 	appState.State.AddBalance(block.Header.ProposedHeader.Coinbase, balanceAdd)
 	appState.State.AddStake(block.Header.ProposedHeader.Coinbase, stakeAdd)
-	chain.blockStatsCollector.AddMintedCoins(chain.config.Consensus.BlockReward)
-	chain.blockStatsCollector.AddBurntCoins(intBurn)
 	if penaltySub != nil {
 		appState.State.SubPenalty(block.Header.ProposedHeader.Coinbase, penaltySub)
-		chain.blockStatsCollector.AfterSubPenalty(block.Header.ProposedHeader.Coinbase, penaltySub, appState)
-		chain.blockStatsCollector.AddBurntCoins(penaltySub)
-	}
-	chain.blockStatsCollector.AddProposerReward(block.Header.ProposedHeader.Coinbase, reward, stake)
 
-	chain.rewardFinalCommittee(appState, block, prevBlock)
+	}
+	collector.AfterBalanceUpdate(statsCollector, block.Header.ProposedHeader.Coinbase, appState)
+	collector.AddMintedCoins(statsCollector, chain.config.Consensus.BlockReward)
+	collector.AddBurntCoins(statsCollector, intBurn)
+	collector.AfterAddStake(statsCollector, block.Header.ProposedHeader.Coinbase, stake)
+	collector.AfterSubPenalty(statsCollector, block.Header.ProposedHeader.Coinbase, penaltySub, appState)
+	collector.AddBurntCoins(statsCollector, penaltySub)
+	collector.AddProposerReward(statsCollector, block.Header.ProposedHeader.Coinbase, reward, stake)
+
+	chain.rewardFinalCommittee(appState, block, prevBlock, statsCollector)
 }
 
 func calculatePenalty(balanceAppend *big.Int, stakeAppend *big.Int, currentPenalty *big.Int) (balanceAdd *big.Int, stakeAdd *big.Int, penaltySub *big.Int) {
@@ -398,18 +412,19 @@ func calculatePenalty(balanceAppend *big.Int, stakeAppend *big.Int, currentPenal
 	return big.NewInt(0), big.NewInt(0), new(big.Int).Add(balanceAppend, stakeAppend)
 }
 
-func (chain *Blockchain) applyNewEpoch(appState *appstate.AppState, block *types.Block) {
+func (chain *Blockchain) applyNewEpoch(appState *appstate.AppState, block *types.Block,
+	statsCollector collector.StatsCollector) {
 
 	if !block.Header.Flags().HasFlag(types.ValidationFinished) {
 		return
 	}
-	networkSize, authors, failed := chain.applyNewEpochFn(block.Height(), appState, chain.blockStatsCollector)
+	networkSize, authors, failed := chain.applyNewEpochFn(block.Height(), appState, statsCollector)
 
-	setNewIdentitiesAttributes(appState, networkSize, failed, chain.blockStatsCollector)
+	setNewIdentitiesAttributes(appState, networkSize, failed, statsCollector)
 
 	if !failed {
 		rewardValidIdentities(appState, chain.config.Consensus, authors, block.Height()-appState.State.EpochBlock(),
-			chain.blockStatsCollector)
+			statsCollector)
 	}
 
 	appState.State.IncEpoch()
@@ -424,7 +439,7 @@ func (chain *Blockchain) applyNewEpoch(appState *appstate.AppState, block *types
 }
 
 func setNewIdentitiesAttributes(appState *appstate.AppState, networkSize int, validationFailed bool,
-	collector collector.BlockStatsCollector) {
+	statsCollector collector.StatsCollector) {
 
 	_, invites, flips := common.NetworkParams(networkSize)
 	appState.State.IterateOverIdentities(func(addr common.Address, identity state.Identity) {
@@ -440,9 +455,6 @@ func setNewIdentitiesAttributes(appState *appstate.AppState, networkSize int, va
 				appState.State.SetInvites(addr, 0)
 				appState.IdentityState.Add(addr)
 			case state.Killed, state.Undefined:
-				// Stake of killed identity is burnt
-				collector.AddBurntCoins(appState.State.GetStakeBalance(addr))
-
 				removeLinksWithInviterAndInvitees(appState.State, addr)
 				appState.State.SetInvites(addr, 0)
 				appState.State.SetRequiredFlips(addr, 0)
@@ -453,7 +465,7 @@ func setNewIdentitiesAttributes(appState *appstate.AppState, networkSize int, va
 				appState.IdentityState.Remove(addr)
 			}
 		}
-		collector.BeforeClearPenalty(addr, appState)
+		collector.BeforeClearPenalty(statsCollector, addr, appState)
 		appState.State.ClearPenalty(addr)
 		appState.State.ClearFlips(addr)
 	})
@@ -481,7 +493,8 @@ func removeLinkWithInvitees(stateDB *state.StateDB, inviterAddr common.Address) 
 	}
 }
 
-func (chain *Blockchain) applyGlobalParams(appState *appstate.AppState, block *types.Block) {
+func (chain *Blockchain) applyGlobalParams(appState *appstate.AppState, block *types.Block,
+	statsCollector collector.StatsCollector) {
 
 	flags := block.Header.Flags()
 	if flags.HasFlag(types.FlipLotteryStarted) {
@@ -510,11 +523,12 @@ func (chain *Blockchain) applyGlobalParams(appState *appstate.AppState, block *t
 
 	if flags.HasFlag(types.OfflineCommit) {
 		addr := block.Header.OfflineAddr()
-		chain.applyOfflinePenalty(appState, *addr)
+		chain.applyOfflinePenalty(appState, *addr, statsCollector)
 	}
 }
 
-func (chain *Blockchain) applyOfflinePenalty(appState *appstate.AppState, addr common.Address) {
+func (chain *Blockchain) applyOfflinePenalty(appState *appstate.AppState, addr common.Address,
+	statsCollector collector.StatsCollector) {
 	networkSize := appState.ValidatorsCache.NetworkSize()
 
 	if networkSize > 0 {
@@ -522,14 +536,15 @@ func (chain *Blockchain) applyOfflinePenalty(appState *appstate.AppState, addr c
 		totalPenalty := new(big.Int).Mul(totalBlockReward, big.NewInt(chain.config.Consensus.OfflinePenaltyBlocksCount))
 		coins := decimal.NewFromBigInt(totalPenalty, 0)
 		res := coins.Div(decimal.New(int64(networkSize), 0))
-		chain.blockStatsCollector.BeforeSetPenalty(addr, appState)
+		collector.BeforeSetPenalty(statsCollector, addr, appState)
 		appState.State.SetPenalty(addr, math.ToInt(res))
 	}
 
 	appState.IdentityState.SetOnline(addr, false)
 }
 
-func (chain *Blockchain) rewardFinalCommittee(appState *appstate.AppState, block *types.Block, prevBlock *types.Header) {
+func (chain *Blockchain) rewardFinalCommittee(appState *appstate.AppState, block *types.Block, prevBlock *types.Header,
+	statsCollector collector.StatsCollector) {
 	if block.IsEmpty() {
 		return
 	}
@@ -551,18 +566,21 @@ func (chain *Blockchain) rewardFinalCommittee(appState *appstate.AppState, block
 		// update state
 		appState.State.AddBalance(addr, balanceAdd)
 		appState.State.AddStake(addr, stakeAdd)
-		chain.blockStatsCollector.AddMintedCoins(reward)
-		chain.blockStatsCollector.AddMintedCoins(stake)
 		if penaltySub != nil {
 			appState.State.SubPenalty(addr, penaltySub)
-			chain.blockStatsCollector.AfterSubPenalty(addr, penaltySub, appState)
-			chain.blockStatsCollector.AddBurntCoins(penaltySub)
 		}
-		chain.blockStatsCollector.AddFinalCommitteeReward(addr, reward, stake)
+		collector.AfterBalanceUpdate(statsCollector, addr, appState)
+		collector.AddMintedCoins(statsCollector, reward)
+		collector.AddMintedCoins(statsCollector, stake)
+		collector.AfterAddStake(statsCollector, addr, stake)
+		collector.AfterSubPenalty(statsCollector, addr, penaltySub, appState)
+		collector.AddBurntCoins(statsCollector, penaltySub)
+		collector.AddFinalCommitteeReward(statsCollector, addr, reward, stake)
 	}
 }
 
-func (chain *Blockchain) processTxs(appState *appstate.AppState, block *types.Block) (totalFee *big.Int, totalTips *big.Int, err error) {
+func (chain *Blockchain) processTxs(appState *appstate.AppState, block *types.Block,
+	statsCollector collector.StatsCollector) (totalFee *big.Int, totalTips *big.Int, err error) {
 	totalFee = new(big.Int)
 	totalTips = new(big.Int)
 	fee := new(big.Int)
@@ -571,7 +589,7 @@ func (chain *Blockchain) processTxs(appState *appstate.AppState, block *types.Bl
 		if err := validation.ValidateTx(appState, tx, chain.config.Consensus.MinFeePerByte, false); err != nil {
 			return nil, nil, err
 		}
-		if fee, err = chain.ApplyTxOnState(appState, tx); err != nil {
+		if fee, err = chain.ApplyTxOnState(appState, tx, statsCollector); err != nil {
 			return nil, nil, err
 		}
 
@@ -582,7 +600,8 @@ func (chain *Blockchain) processTxs(appState *appstate.AppState, block *types.Bl
 	return totalFee, totalTips, nil
 }
 
-func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.Transaction) (*big.Int, error) {
+func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.Transaction,
+	statsCollector collector.StatsCollector) (*big.Int, error) {
 
 	stateDB := appState.State
 
@@ -620,7 +639,6 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		// zero balance and kill temp identity
 		stateDB.SetBalance(sender, big.NewInt(0))
 		stateDB.SetState(sender, state.Killed)
-		chain.blockStatsCollector.AddBurntCoins(appState.State.GetStakeBalance(sender))
 
 		// verify identity and add transfer all available funds from temp account
 		recipient := *tx.To
@@ -635,10 +653,19 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 			stateDB.AddInvitee(inviter.Address, recipient, inviter.TxHash)
 			stateDB.SetInviter(recipient, inviter.Address, inviter.TxHash)
 		}
+
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AfterKillIdentity(statsCollector, sender, appState)
+		collector.AfterBalanceUpdate(statsCollector, recipient, appState)
+		if sender != *tx.To {
+			collector.AddBurntCoins(statsCollector, appState.State.GetStakeBalance(sender))
+		}
 		break
 	case types.SendTx:
 		stateDB.SubBalance(sender, totalCost)
 		stateDB.AddBalance(*tx.To, tx.AmountOrZero())
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AfterBalanceUpdate(statsCollector, *tx.To, appState)
 		break
 	case types.BurnTx:
 		stateDB.SubBalance(sender, totalCost)
@@ -656,6 +683,8 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		stateDB.SetGeneticCode(*tx.To, generation+1, append(code[1:], sender[0]))
 
 		stateDB.SetInviter(*tx.To, sender, tx.Hash())
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AfterBalanceUpdate(statsCollector, *tx.To, appState)
 		break
 	case types.KillTx:
 		removeLinksWithInviterAndInvitees(stateDB, sender)
@@ -666,6 +695,9 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		stateDB.SubBalance(sender, tx.TipsOrZero())
 		stateDB.AddBalance(*tx.To, new(big.Int).Sub(stateDB.GetStakeBalance(sender), fee))
 		stateDB.AddBalance(*tx.To, amount)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AfterBalanceUpdate(statsCollector, *tx.To, appState)
+		collector.AfterKillIdentity(statsCollector, sender, appState)
 		break
 	case types.KillInviteeTx:
 		removeLinksWithInviterAndInvitees(stateDB, *tx.To)
@@ -682,21 +714,27 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 				stateDB.AddInvite(sender, 1)
 			}
 		}
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AfterBalanceUpdate(statsCollector, *tx.To, appState)
+		collector.AfterKillIdentity(statsCollector, *tx.To, appState)
 		break
 	case types.SubmitFlipTx:
 		stateDB.SubBalance(sender, fee)
 		stateDB.SubBalance(sender, tx.TipsOrZero())
 		attachment := attachments.ParseFlipSubmitAttachment(tx)
 		stateDB.AddFlip(sender, attachment.Cid, attachment.Pair)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
 	case types.OnlineStatusTx:
 		stateDB.SubBalance(sender, fee)
 		stateDB.SubBalance(sender, tx.TipsOrZero())
 		attachment := attachments.ParseOnlineStatusAttachment(tx)
 		appState.IdentityState.SetOnline(sender, attachment.Online)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
 	case types.ChangeGodAddressTx:
 		stateDB.SubBalance(sender, fee)
 		stateDB.SubBalance(sender, tx.TipsOrZero())
 		appState.State.SetGodAddress(*tx.To)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
 	case types.ChangeProfileTx:
 		stateDB.SubBalance(sender, fee)
 		stateDB.SubBalance(sender, tx.TipsOrZero())
@@ -830,9 +868,9 @@ func (chain *Blockchain) ProposeBlock() *types.Block {
 	}
 	block.Header.ProposedHeader.Flags |= chain.calculateFlags(checkState, block)
 
-	chain.applyNewEpoch(checkState, block)
-	chain.applyBlockRewards(totalFee, totalTips, checkState, block, chain.Head)
-	chain.applyGlobalParams(checkState, block)
+	chain.applyNewEpoch(checkState, block, nil)
+	chain.applyBlockRewards(totalFee, totalTips, checkState, block, chain.Head, nil)
+	chain.applyGlobalParams(checkState, block, nil)
 	chain.applyNextBlockFee(checkState, block)
 	chain.applyVrfProposerThreshold(checkState, block)
 	checkState.Precommit()
@@ -925,7 +963,7 @@ func (chain *Blockchain) filterTxs(appState *appstate.AppState, txs []*types.Tra
 		if err := validation.ValidateTx(appState, tx, chain.config.Consensus.MinFeePerByte, false); err != nil {
 			continue
 		}
-		if fee, err := chain.ApplyTxOnState(appState, tx); err == nil {
+		if fee, err := chain.ApplyTxOnState(appState, tx, nil); err == nil {
 			totalFee.Add(totalFee, fee)
 			totalTips.Add(totalTips, tx.TipsOrZero())
 			result = append(result, tx)
@@ -1023,7 +1061,7 @@ func (chain *Blockchain) validateBlock(checkState *appstate.AppState, block *typ
 		return errors.Errorf("flags are invalid, expected=%v, actual=%v", expexted, persistentFlags)
 	}
 
-	if root, identityRoot, _, err := chain.applyBlockOnState(checkState, block, prevBlock); err != nil {
+	if root, identityRoot, _, err := chain.applyBlockOnState(checkState, block, prevBlock, nil); err != nil {
 		return err
 	} else if root != block.Root() || identityRoot != block.IdentityRoot() {
 		return errors.Errorf("invalid block roots. Expected=%x & %x, actual=%x & %x", root, identityRoot, block.Root(), block.IdentityRoot())
