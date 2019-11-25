@@ -668,6 +668,8 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		break
 	case types.BurnTx:
 		stateDB.SubBalance(sender, totalCost)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
+		collector.AddBurnTxBurntCoins(statsCollector, sender, tx)
 		break
 	case types.InviteTx:
 		if sender != stateDB.GodAddress() {
@@ -739,6 +741,7 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 		stateDB.SubBalance(sender, tx.TipsOrZero())
 		attachment := attachments.ParseChangeProfileAttachment(tx)
 		stateDB.SetProfileHash(sender, attachment.Hash)
+		collector.AfterBalanceUpdate(statsCollector, sender, appState)
 		break
 	}
 

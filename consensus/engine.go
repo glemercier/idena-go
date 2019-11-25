@@ -73,7 +73,7 @@ func NewEngine(chain *blockchain.Blockchain, pm *protocol.ProtocolManager, propo
 		txpool:            txpool,
 		downloader:        downloader,
 		secStore:          secStore,
-		forkResolver:      NewForkResolver([]ForkDetector{proposals, downloader}, downloader, chain),
+		forkResolver:      NewForkResolver([]ForkDetector{proposals, downloader}, downloader, chain, statsCollector),
 		offlineDetector:   offlineDetector,
 		nextBlockDetector: newNextBlockDetector(pm, downloader, chain),
 		statsCollector:    statsCollector,
